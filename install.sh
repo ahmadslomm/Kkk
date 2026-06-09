@@ -1,77 +1,131 @@
-#!/bin/bash
-
-echo "================================"
-echo "  🤖 إعداد بوت مراقبة الحجم"
-echo "================================"
-echo ""
-
-mkdir -p volume_bot && cd volume_bot
-
-# جمع البيانات
-read -p "🔑 Binance API Key: " API_KEY
-read -p "🔐 Binance Secret: " API_SECRET
-read -p "🤖 Telegram Bot Token: " TG_TOKEN
-read -p "💬 Telegram Chat ID: " TG_CHAT
-
-# حفظ .env
-cat > .env << EOF
-BINANCE_API_KEY=$API_KEY
-BINANCE_SECRET=$API_SECRET
-TELEGRAM_TOKEN=$TG_TOKEN
-TELEGRAM_CHAT_ID=$TG_CHAT
-EOF
-
-# إنشاء requirements.txt
-cat > requirements.txt << 'EOF'
-ccxt==4.3.89
-pandas==2.2.2
-python-telegram-bot==21.5
-python-dotenv==1.0.1
-EOF
-
-# إنشاء bot.py
-cat > bot.py << 'EOF'
 import ccxt
 import pandas as pd
 import asyncio
 import logging
-from telegram import Bot
-from datetime import datetime
+import sqlite3
 import time
 import os
+from telegram import Bot
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
 
-BINANCE_API_KEY  = os.getenv("BINANCE_API_KEY")
-BINANCE_SECRET   = os.getenv("BINANCE_SECRET")
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# ──────────────────────────────────────────
+# إعدادات
+# ──────────────────────────────────────────
+BINANCE_API_KEY          = os.getenv("BINANCE_API_KEY")
+BINANCE_SECRET           = os.getenv("BINANCE_SECRET")
+TELEGRAM_TOKEN           = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID         = os.getenv("TELEGRAM_CHAT_ID")
 
-VOLUME_SPIKE_MULTIPLIER = 3.0
-CANDLES_LOOKBACK        = 20
-PRICE_CHANGE_MAX        = 5.0
-PRICE_CHANGE_MIN        = 2.0
-CHECK_INTERVAL          = 60
-QUOTE_CURRENCY          = "USDC"
+QUOTE_CURRENCY           = "USDC"
+CHECK_INTERVAL           = 45          # ثانية بين كل فحص
+ALERT_COOLDOWN           = 900         # 15 دقيقة بين تنبيهين لنفس العملة
+MIN_DAILY_VOLUME         = 500_000     # حجم يومي أدنى بـ USDC
+BTC_MAX_MOVE_PCT         = 1.0         # لو BTC تحرك أكثر من هيك = تجميد التنبيهات
 
+# ──────────────────────────────────────────
+# Logging
+# ──────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler("bot.log"), logging.StreamHandler()]
+    handlers=[
+        logging.FileHandler("bot.log", encoding="utf-8"),
+        logging.StreamHandler()
+    ]
 )
 log = logging.getLogger(__name__)
 
+# ──────────────────────────────────────────
+# التهيئة
+# ──────────────────────────────────────────
 exchange = ccxt.binance({
     "apiKey": BINANCE_API_KEY,
     "secret": BINANCE_SECRET,
     "enableRateLimit": True,
 })
 
-bot = Bot(token=TELEGRAM_TOKEN)
-alerted_symbols = {}
+bot          = Bot(token=TELEGRAM_TOKEN)
+alerted_at   = {}   # symbol -> timestamp آخر تنبيه
 
 
+# ──────────────────────────────────────────
+# قاعدة البيانات
+# ──────────────────────────────────────────
+def init_db():
+    conn = sqlite3.connect("alerts.db")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS alerts (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol      TEXT,
+            price       REAL,
+            score       INTEGER,
+            vol_ratio   REAL,
+            buy_pct     REAL,
+            timestamp   TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS results (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol       TEXT,
+            alert_price  REAL,
+            check_price  REAL,
+            change_pct   REAL,
+            checked_at   TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def save_alert(symbol, price, score, vol_ratio, buy_pct):
+    conn = sqlite3.connect("alerts.db")
+    conn.execute(
+        "INSERT INTO alerts (symbol, price, score, vol_ratio, buy_pct, timestamp) VALUES (?,?,?,?,?,?)",
+        (symbol, price, score, vol_ratio, buy_pct, datetime.now().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+
+def save_result(symbol, alert_price, check_price):
+    change = (check_price - alert_price) / alert_price * 100
+    conn   = sqlite3.connect("alerts.db")
+    conn.execute(
+        "INSERT INTO results (symbol, alert_price, check_price, change_pct, checked_at) VALUES (?,?,?,?,?)",
+        (symbol, alert_price, check_price, change, datetime.now().isoformat())
+    )
+    conn.commit()
+    conn.close()
+    return change
+
+
+# ──────────────────────────────────────────
+# فحص BTC
+# ──────────────────────────────────────────
+def btc_is_stable():
+    try:
+        ohlcv = exchange.fetch_ohlcv("BTC/USDC", "1m", limit=4)
+        if len(ohlcv) < 3:
+            return True
+        first = ohlcv[-3][4]
+        last  = ohlcv[-1][4]
+        move  = abs((last - first) / first * 100)
+        if move > BTC_MAX_MOVE_PCT:
+            log.info(f"⚠️ BTC يتحرك {move:.2f}% — تجميد التنبيهات")
+            return False
+        return True
+    except Exception as e:
+        log.warning(f"تعذّر فحص BTC: {e}")
+        return True
+
+
+# ──────────────────────────────────────────
+# جلب العملات
+# ──────────────────────────────────────────
 def get_all_symbols():
     markets = exchange.load_markets()
     return [
@@ -82,146 +136,231 @@ def get_all_symbols():
     ]
 
 
+# ──────────────────────────────────────────
+# التحليل الرئيسي
+# ──────────────────────────────────────────
 def analyze_symbol(symbol):
     try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe="5m", limit=CANDLES_LOOKBACK + 1)
-        if len(ohlcv) < CANDLES_LOOKBACK:
+        # ── فلتر الحجم اليومي ──
+        ticker = exchange.fetch_ticker(symbol)
+        if (ticker.get("quoteVolume") or 0) < MIN_DAILY_VOLUME:
             return None
 
-        df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
-        current_candle  = df.iloc[-1]
-        previous_candles = df.iloc[:-1]
-
-        avg_volume     = previous_candles["volume"].mean()
-        current_volume = current_candle["volume"]
-        if avg_volume == 0:
+        # ── جلب شموع 1m ──
+        ohlcv = exchange.fetch_ohlcv(symbol, "1m", limit=25)
+        if len(ohlcv) < 20:
             return None
 
-        volume_ratio  = current_volume / avg_volume
-        price_5_ago   = df.iloc[-6]["close"] if len(df) >= 6 else df.iloc[0]["close"]
-        current_price = current_candle["close"]
-        price_change_pct = abs((current_price - price_5_ago) / price_5_ago * 100)
+        df = pd.DataFrame(ohlcv, columns=["ts", "o", "h", "l", "c", "v"])
+
+        score  = 0
+        detail = {}
+
+        # ── شرط 1: تسارع الحجم ──
+        v1 = df["v"].iloc[-4]
+        v2 = df["v"].iloc[-3]
+        v3 = df["v"].iloc[-2]
+        v4 = df["v"].iloc[-1]
+        vol_ratio = v4 / df["v"].iloc[:-1].mean() if df["v"].iloc[:-1].mean() > 0 else 0
+
+        accelerating = (v1 < v2 < v3 < v4) and vol_ratio >= 2.5
+        detail["vol_ratio"]    = round(vol_ratio, 1)
+        detail["accelerating"] = accelerating
+        if accelerating:
+            score += 1
+
+        # ── شرط 2: الشموع تغلق في النص العلوي ──
+        strong_closes = 0
+        for row in df.iloc[-4:-1].itertuples():
+            mid = (row.h + row.l) / 2
+            if row.c > mid:
+                strong_closes += 1
+        detail["strong_closes"] = strong_closes
+        if strong_closes >= 2:
+            score += 1
+
+        # ── شرط 3: قيعان ترتفع (Higher Lows) ──
+        lows        = df["l"].iloc[-6:].values
+        higher_lows = all(lows[i] >= lows[i - 1] for i in range(1, len(lows)))
+        detail["higher_lows"] = higher_lows
+        if higher_lows:
+            score += 1
+
+        # ── شرط 4: ضغط شراء في Order Book ──
+        ob       = exchange.fetch_order_book(symbol, limit=20)
+        bid_vol  = sum(x[1] for x in ob["bids"])
+        ask_vol  = sum(x[1] for x in ob["asks"])
+        total    = bid_vol + ask_vol
+        buy_pct  = (bid_vol / total * 100) if total > 0 else 50
+        detail["buy_pct"] = round(buy_pct, 1)
+        if buy_pct > 65:
+            score += 1
+
+        # ── شرط 5: قريب من الاختراق (Coiling) ──
+        resistance      = df["h"].iloc[-20:].max()
+        current_price   = df["c"].iloc[-1]
+        dist_to_res_pct = (resistance - current_price) / current_price * 100
+        detail["dist_to_resistance"] = round(dist_to_res_pct, 2)
+        detail["resistance"]         = resistance
+        if 0 < dist_to_res_pct < 0.8:
+            score += 1
+
+        # ── إرجاع النتيجة فقط إذا score >= 4 ──
+        if score < 4:
+            return None
 
         return {
-            "symbol": symbol,
-            "price": current_price,
-            "volume_ratio": volume_ratio,
-            "price_change_pct": price_change_pct,
+            "symbol":   symbol,
+            "price":    current_price,
+            "score":    score,
+            **detail,
         }
+
     except Exception as e:
         log.debug(f"خطأ في {symbol}: {e}")
         return None
 
 
-async def send_alert(data, alert_type):
-    emoji = "🟡" if alert_type == "accumulation" else "🚀"
-    label = "تجميع صامت" if alert_type == "accumulation" else "بداية حركة"
+# ──────────────────────────────────────────
+# إرسال التنبيه
+# ──────────────────────────────────────────
+async def send_alert(data):
+    stars     = "⭐" * data["score"]
+    acc_emoji = "✅" if data["accelerating"]  else "❌"
+    hl_emoji  = "✅" if data["higher_lows"]   else "❌"
+    sc_emoji  = "✅" if data["strong_closes"] >= 2 else "❌"
+    bp_emoji  = "✅" if data["buy_pct"] > 65  else "❌"
+    co_emoji  = "✅" if 0 < data["dist_to_resistance"] < 0.8 else "❌"
+
     msg = (
-        f"{emoji} *{label}* | `{data['symbol']}`\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"💰 السعر: `{data['price']:.6f}`\n"
-        f"📊 الحجم: `{data['volume_ratio']:.1f}x` من المعتاد\n"
-        f"📈 تغير السعر: `{data['price_change_pct']:.2f}%`\n"
-        f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"⚠️ _هذا رصد تقني وليس نصيحة مالية_"
+        f"⚡️ *تجميع مؤكد* | `{data['symbol']}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🏆 القوة: {stars}  ({data['score']}/5)\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{acc_emoji} حجم متسارع:      `{data['vol_ratio']}x`\n"
+        f"{sc_emoji} شموع قوية:        `{data['strong_closes']}/3`\n"
+        f"{hl_emoji} قيعان ترتفع:      `{'نعم' if data['higher_lows'] else 'لا'}`\n"
+        f"{bp_emoji} ضغط شراء:         `{data['buy_pct']}%`\n"
+        f"{co_emoji} قريب الاختراق:    `{data['dist_to_resistance']}%`\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 مقاومة: `{data['resistance']:.6f}`\n"
+        f"💰 السعر:  `{data['price']:.6f}`\n"
+        f"🕐 {datetime.now().strftime('%H:%M:%S')}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚠️ _رصد تقني فقط، ليس نصيحة مالية_"
     )
+
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode="Markdown")
-    log.info(f"تنبيه أُرسل: {data['symbol']} ({label})")
+    log.info(f"✅ تنبيه أُرسل: {data['symbol']} | score={data['score']}")
+
+    # حفظ في DB
+    save_alert(data["symbol"], data["price"], data["score"], data["vol_ratio"], data["buy_pct"])
+
+    # جدولة فحص النتيجة بعد 20 دقيقة
+    asyncio.create_task(check_result_later(data["symbol"], data["price"]))
 
 
-def should_alert(symbol):
+# ──────────────────────────────────────────
+# تتبع النتيجة بعد 20 دقيقة
+# ──────────────────────────────────────────
+async def check_result_later(symbol, alert_price):
+    await asyncio.sleep(1200)  # 20 دقيقة
+    try:
+        ticker      = exchange.fetch_ticker(symbol)
+        check_price = ticker["last"]
+        change      = save_result(symbol, alert_price, check_price)
+        emoji       = "🟢" if change > 0 else "🔴"
+        await bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=(
+                f"{emoji} *نتيجة التنبيه* | `{symbol}`\n"
+                f"سعر التنبيه: `{alert_price:.6f}`\n"
+                f"السعر الآن:  `{check_price:.6f}`\n"
+                f"التغير:      `{change:+.2f}%` بعد 20 دقيقة"
+            ),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        log.warning(f"فشل فحص النتيجة لـ {symbol}: {e}")
+
+
+# ──────────────────────────────────────────
+# فحص cooldown
+# ──────────────────────────────────────────
+def can_alert(symbol):
     now = time.time()
-    if now - alerted_symbols.get(symbol, 0) > 1800:
-        alerted_symbols[symbol] = now
+    if now - alerted_at.get(symbol, 0) > ALERT_COOLDOWN:
+        alerted_at[symbol] = now
         return True
     return False
 
 
+# ──────────────────────────────────────────
+# الفحص الرئيسي
+# ──────────────────────────────────────────
 async def run_scan():
-    log.info("🔍 بدء فحص السوق...")
-    symbols = get_all_symbols()
-    log.info(f"إجمالي العملات: {len(symbols)}")
+    log.info("🔍 بدء الفحص...")
 
-    accumulation_list, pump_list = [], []
+    if not btc_is_stable():
+        log.info("⏸️ BTC غير مستقر — تأجيل الفحص")
+        return
+
+    symbols = get_all_symbols()
+    log.info(f"العملات: {len(symbols)}")
+
+    found = []
 
     for i, symbol in enumerate(symbols):
         result = analyze_symbol(symbol)
-        if result is None:
-            continue
-        if result["volume_ratio"] >= VOLUME_SPIKE_MULTIPLIER:
-            if result["price_change_pct"] < PRICE_CHANGE_MAX:
-                accumulation_list.append(result)
-            elif result["price_change_pct"] >= PRICE_CHANGE_MIN:
-                pump_list.append(result)
-        if i % 10 == 0:
-            await asyncio.sleep(0.5)
+        if result:
+            found.append(result)
+        if i % 15 == 0:
+            await asyncio.sleep(0.3)
 
-    accumulation_list.sort(key=lambda x: x["volume_ratio"], reverse=True)
-    pump_list.sort(key=lambda x: x["volume_ratio"], reverse=True)
+    # ترتيب بالأقوى أولاً
+    found.sort(key=lambda x: (x["score"], x["vol_ratio"]), reverse=True)
 
-    for data in accumulation_list[:5]:
-        if should_alert(data["symbol"]):
-            await send_alert(data, "accumulation")
-            await asyncio.sleep(1)
+    sent = 0
+    for data in found:
+        if sent >= 3:   # أقصى 3 تنبيهات بكل فحص
+            break
+        if can_alert(data["symbol"]):
+            await send_alert(data)
+            await asyncio.sleep(1.5)
+            sent += 1
 
-    for data in pump_list[:5]:
-        if should_alert(data["symbol"]):
-            await send_alert(data, "pump")
-            await asyncio.sleep(1)
-
-    log.info(f"✅ انتهى الفحص | تجميع: {len(accumulation_list)} | حركة: {len(pump_list)}")
+    log.info(f"✅ انتهى الفحص | إشارات قوية: {len(found)} | أُرسل: {sent}")
 
 
+# ──────────────────────────────────────────
+# الحلقة الرئيسية
+# ──────────────────────────────────────────
 async def main():
+    init_db()
     log.info("🤖 البوت شغّال...")
+
     await bot.send_message(
         chat_id=TELEGRAM_CHAT_ID,
-        text="✅ *بوت مراقبة الحجم شغّال*\nسأراقب السوق وأنبهك عند اكتشاف أي حركة مشبوهة 👀",
+        text=(
+            "✅ *بوت التجميع شغّال*\n"
+            "━━━━━━━━━━━━━━━━\n"
+            "🎯 الشروط: 4 من 5 لازم تتحقق\n"
+            "⏱️ فحص كل 45 ثانية\n"
+            "📊 متابعة النتيجة بعد 20 دقيقة\n"
+            "━━━━━━━━━━━━━━━━\n"
+            "👀 أراقب السوق..."
+        ),
         parse_mode="Markdown"
     )
+
     while True:
         try:
             await run_scan()
         except Exception as e:
             log.error(f"خطأ: {e}")
-        log.info(f"⏳ انتظار {CHECK_INTERVAL} ثانية...")
+        log.info(f"⏳ انتظار {CHECK_INTERVAL}ث...")
         await asyncio.sleep(CHECK_INTERVAL)
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-EOF
-
-# إنشاء service
-cat > volume_bot.service << EOF
-[Unit]
-Description=Binance Volume Spike Bot
-After=network.target
-
-[Service]
-Type=simple
-User=$USER
-WorkingDirectory=$(pwd)
-ExecStart=$(pwd)/venv/bin/python bot.py
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# تثبيت المكتبات
-echo ""
-echo "📦 تثبيت المكتبات..."
-python3 -m venv venv
-source venv/bin/activate
-pip install -q -r requirements.txt
-
-# تفعيل السيرفس
-sudo cp volume_bot.service /etc/systemd/system/
-sudo systemctl enable --now volume_bot
-
-echo ""
-echo "✅ البوت شغّال! تحقق منه بـ:"
-echo "   sudo systemctl status volume_bot"
